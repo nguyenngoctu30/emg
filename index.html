@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>ESP32 Data</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+</head>
+<body>
+  <h1>ESP32-C6 Data Monitor</h1>
+  
+  <p>Status: <span id="status">Connecting...</span></p>
+  <p>Data Rate: <span id="dataRate">0</span> msg/sec</p>
+  <p>Last Update: <span id="lastUpdate">-</span></p>
+  
+  <h2>Channel 0 (GPIO 0)</h2>
+  <p>Raw: <span id="ch0raw">-</span></p>
+  <p>Avg: <span id="ch0avg">-</span></p>
+  
+  <h2>Channel 1 (GPIO 1)</h2>
+  <p>Raw: <span id="ch1raw">-</span></p>
+  <p>Avg: <span id="ch1avg">-</span></p>
+  
+  <h2>Real-time Charts</h2>
+  <h3>Channel 0 Raw Values</h3>
+  <canvas id="chart0" width="800" height="300"></canvas>
+  
+  <h3>Channel 1 Raw Values</h3>
+  <canvas id="chart1" width="800" height="300"></canvas>
+  
+  <h2>Latest Data:</h2>
+  <pre id="data">Waiting...</pre>
+
+  <script>
+    const ws = new WebSocket('wss://dimension-remarks-promising-notebooks.trycloudflare.com');
+    
+    // Data rate tracking
+    let messageCount = 0;
+    let lastRateUpdate = Date.now();
+    
+    // Chart data (keep last 100 points)
+    const maxDataPoints = 500;
+    const chartData0 = [];
+    const chartData1 = [];
+    const timeLabels = [];
+    
+    // Initialize Chart.js for Channel 0
+    const ctx0 = document.getElementById('chart0').getContext('2d');
+    const chart0 = new Chart(ctx0, {
+      type: 'line',
+      data: {
+        labels: timeLabels,
+        datasets: [{
+          label: 'Channel 0 Raw',
+          data: chartData0,
+          borderColor: 'rgb(75, 192, 192)',
+          backgroundColor: 'rgba(75, 192, 192, 0.1)',
+          tension: 0.1,
+          pointRadius: 0
+        }]
+      },
+      options: {
+        responsive: false,
+        animation: false,
+        scales: {
+          x: {
+            display: true,
+            title: {
+              display: true,
+              text: 'Time'
+            }
+          },
+          y: {
+            display: true,
+            title: {
+              display: true,
+              text: 'Value'
+            },
+            beginAtZero: true
+          }
+        }
+      }
+    });
+    
+    // Initialize Chart.js for Channel 1
+    const ctx1 = document.getElementById('chart1').getContext('2d');
+    const chart1 = new Chart(ctx1, {
+      type: 'line',
+      data: {
+        labels: timeLabels,
+        datasets: [{
+          label: 'Channel 1 Raw',
+          data: chartData1,
+          borderColor: 'rgb(255, 99, 132)',
+          backgroundColor: 'rgba(255, 99, 132, 0.1)',
+          tension: 0.1,
+          pointRadius: 0
+        }]
+      },
+      options: {
+        responsive: false,
+        animation: false,
+        scales: {
+          x: {
+            display: true,
+            title: {
+              display: true,
+              text: 'Time'
+            }
+          },
+          y: {
+            display: true,
+            title: {
+              display: true,
+              text: 'Value'
+            },
+            beginAtZero: true
+          }
+        }
+      }
+    });
+    
+    ws.onopen = () => {
+      document.getElementById('status').textContent = 'Connected';
+    };
+    
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      
+      // Update message count
+      messageCount++;
+      const now = Date.now();
+      if (now - lastRateUpdate >= 100) {
+        document.getElementById('dataRate').textContent = messageCount;
+        messageCount = 0;
+        lastRateUpdate = now;
+      }
+      
+      // Update last update time
+      const time = new Date().toLocaleTimeString();
+      document.getElementById('lastUpdate').textContent = time;
+      
+      if (data.channel0) {
+        document.getElementById('ch0raw').textContent = data.channel0.rawValue;
+        document.getElementById('ch0avg').textContent = data.channel0.averageValue;
+        
+        // Add to chart (RAW value)
+        chartData0.push(data.channel0.rawValue);
+      }
+      
+      if (data.channel1) {
+        document.getElementById('ch1raw').textContent = data.channel1.rawValue;
+        document.getElementById('ch1avg').textContent = data.channel1.averageValue;
+        
+        // Add to chart (RAW value)
+        chartData1.push(data.channel1.rawValue);
+      }
+      
+      // Add time label
+      timeLabels.push(time);
+      
+      // Keep only last N points
+      if (chartData0.length > maxDataPoints) {
+        chartData0.shift();
+        chartData1.shift();
+        timeLabels.shift();
+      }
+      
+      // Update charts
+      chart0.update();
+      chart1.update();
+      
+      document.getElementById('data').textContent = JSON.stringify(data, null, 2);
+    };
+    
+    ws.onerror = () => {
+      document.getElementById('status').textContent = 'Error';
+    };
+    
+    ws.onclose = () => {
+      document.getElementById('status').textContent = 'Disconnected';
+    };
+  </script>
+</body>
+</html>
