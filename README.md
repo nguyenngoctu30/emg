@@ -283,14 +283,3 @@ MIT License - xem file LICENSE để biết thêm chi tiết.
 - **Maintainer**: Server Development Team
 - **Contact**: [Server Host URL](#-server-host)
 
-## 🔗 Links hữu ích
-
-- [Express.js Documentation](https://expressjs.com/)
-- [WebSocket API Documentation](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket)
-- [EMG Data Collection Best Practices](https://example.com)
-
----
-
-**⚠️ Lưu ý**: Server này chủ yếu dùng cho mục đích phát triển và demo. Sử dụng trong production cần thêm các biện pháp bảo mật và tối ưu hóa.
-
-**✨ Tip**: Mở dashboard trong trình duyệt để xem dữ liệu thời gian thực và quản lý server!
