@@ -23,6 +23,10 @@ let stats = {
   devices: {}
 };
 
+// ========== NEW: Store recent frames ==========
+const MAX_STORED_FRAMES = 1000; // Lưu tối đa 1000 frames gần nhất
+let recentFrames = []; // Mảng lưu frames theo thứ tự thời gian
+
 // WebSocket connection handler
 wss.on('connection', (ws) => {
   console.log('📱 Client connected via WebSocket');
@@ -90,6 +94,20 @@ app.post('/api/emg', (req, res) => {
     }
     deviceStats.lastFrameSequence = frameSeq;
     
+    // ========== NEW: Store frame data ==========
+    const frameWithTimestamp = {
+      ...frameData,
+      receivedAt: new Date().toISOString(),
+      serverTimestamp: Date.now()
+    };
+    
+    recentFrames.push(frameWithTimestamp);
+    
+    // Keep only recent frames
+    if (recentFrames.length > MAX_STORED_FRAMES) {
+      recentFrames.shift(); // Remove oldest frame
+    }
+    
     // Log received frame
     console.log(`✓ Frame #${frameSeq} from ${deviceId}: ${samplesCount} samples @ ${frameData.samplingRate}Hz`);
     
@@ -121,12 +139,134 @@ app.post('/api/emg', (req, res) => {
   }
 });
 
+// ========== NEW: Get all recent frames ==========
+app.get('/api/frames', (req, res) => {
+  const limit = parseInt(req.query.limit) || recentFrames.length;
+  const deviceId = req.query.deviceId;
+  
+  let frames = recentFrames;
+  
+  // Filter by device if specified
+  if (deviceId) {
+    frames = frames.filter(f => f.deviceId === deviceId);
+  }
+  
+  // Limit results
+  const result = frames.slice(-limit);
+  
+  res.json({
+    success: true,
+    count: result.length,
+    totalStored: recentFrames.length,
+    frames: result
+  });
+});
+
+// ========== NEW: Get latest frame ==========
+app.get('/api/frames/latest', (req, res) => {
+  const deviceId = req.query.deviceId;
+  
+  let frame = null;
+  
+  if (deviceId) {
+    // Get latest frame from specific device
+    for (let i = recentFrames.length - 1; i >= 0; i--) {
+      if (recentFrames[i].deviceId === deviceId) {
+        frame = recentFrames[i];
+        break;
+      }
+    }
+  } else {
+    // Get latest frame from any device
+    frame = recentFrames[recentFrames.length - 1] || null;
+  }
+  
+  if (frame) {
+    res.json({
+      success: true,
+      frame: frame
+    });
+  } else {
+    res.status(404).json({
+      success: false,
+      message: 'No frames available'
+    });
+  }
+});
+
+// ========== NEW: Get frames by time range ==========
+app.get('/api/frames/range', (req, res) => {
+  const startTime = req.query.start ? new Date(req.query.start).getTime() : 0;
+  const endTime = req.query.end ? new Date(req.query.end).getTime() : Date.now();
+  const deviceId = req.query.deviceId;
+  
+  let frames = recentFrames.filter(f => {
+    const frameTime = f.serverTimestamp;
+    return frameTime >= startTime && frameTime <= endTime;
+  });
+  
+  // Filter by device if specified
+  if (deviceId) {
+    frames = frames.filter(f => f.deviceId === deviceId);
+  }
+  
+  res.json({
+    success: true,
+    count: frames.length,
+    startTime: new Date(startTime).toISOString(),
+    endTime: new Date(endTime).toISOString(),
+    frames: frames
+  });
+});
+
+// ========== NEW: Get frame by sequence number ==========
+app.get('/api/frames/:sequence', (req, res) => {
+  const sequence = parseInt(req.params.sequence);
+  const deviceId = req.query.deviceId;
+  
+  let frame = null;
+  
+  if (deviceId) {
+    frame = recentFrames.find(f => 
+      f.frameSequence === sequence && f.deviceId === deviceId
+    );
+  } else {
+    frame = recentFrames.find(f => f.frameSequence === sequence);
+  }
+  
+  if (frame) {
+    res.json({
+      success: true,
+      frame: frame
+    });
+  } else {
+    res.status(404).json({
+      success: false,
+      message: `Frame #${sequence} not found`
+    });
+  }
+});
+
+// ========== NEW: Delete all stored frames ==========
+app.delete('/api/frames', (req, res) => {
+  const previousCount = recentFrames.length;
+  recentFrames = [];
+  
+  res.json({
+    success: true,
+    message: 'All frames deleted',
+    deletedCount: previousCount
+  });
+});
+
 // HTTP GET endpoint to check server status
 app.get('/api/status', (req, res) => {
   res.json({
     status: 'online',
     connectedClients: clients.length,
     stats: stats,
+    storedFrames: recentFrames.length,
+    maxStoredFrames: MAX_STORED_FRAMES,
     timestamp: new Date().toISOString()
   });
 });
@@ -141,8 +281,18 @@ app.post('/api/reset', (req, res) => {
     lastReceiveTime: null,
     devices: {}
   };
+  
+  // Optionally clear stored frames too
+  if (req.query.clearFrames === 'true') {
+    recentFrames = [];
+  }
+  
   broadcast({ type: 'reset' });
-  res.json({ success: true, message: 'Stats reset' });
+  res.json({ 
+    success: true, 
+    message: 'Stats reset',
+    framesCleared: req.query.clearFrames === 'true'
+  });
 });
 
 // Broadcast function
@@ -209,6 +359,7 @@ app.get('/', (req, res) => {
           display: flex;
           gap: 10px;
           margin-bottom: 20px;
+          flex-wrap: wrap;
         }
         button {
           padding: 10px 20px;
@@ -274,6 +425,36 @@ app.get('/', (req, res) => {
         .log-samples {
           color: #0af;
         }
+        .api-section {
+          background: #2a2a2a;
+          padding: 20px;
+          border-radius: 8px;
+          margin-top: 20px;
+        }
+        .api-section h3 {
+          color: #00ff88;
+          margin-bottom: 15px;
+        }
+        .api-endpoint {
+          background: #1a1a1a;
+          padding: 10px;
+          border-radius: 4px;
+          margin-bottom: 10px;
+          font-family: 'Courier New', monospace;
+          font-size: 12px;
+        }
+        .api-endpoint .method {
+          color: #0af;
+          font-weight: bold;
+          margin-right: 10px;
+        }
+        .api-endpoint .path {
+          color: #00ff88;
+        }
+        .api-endpoint .desc {
+          color: #888;
+          margin-top: 5px;
+        }
         ::-webkit-scrollbar { width: 8px; }
         ::-webkit-scrollbar-track { background: #1a1a1a; }
         ::-webkit-scrollbar-thumb { 
@@ -298,6 +479,10 @@ app.get('/', (req, res) => {
             <div class="stat-value" id="framesReceived">0</div>
           </div>
           <div class="stat-card">
+            <div class="stat-label">Stored Frames</div>
+            <div class="stat-value" id="storedFrames">0</div>
+          </div>
+          <div class="stat-card">
             <div class="stat-label">Total Samples</div>
             <div class="stat-value" id="samplesReceived">0</div>
           </div>
@@ -309,15 +494,13 @@ app.get('/', (req, res) => {
             <div class="stat-label">Frame Rate</div>
             <div class="stat-value" id="frameRate">0 Hz</div>
           </div>
-          <div class="stat-card">
-            <div class="stat-label">Sample Rate</div>
-            <div class="stat-value" id="sampleRate">0 Hz</div>
-          </div>
         </div>
 
         <div class="controls">
           <button onclick="clearLog()">Clear Log</button>
           <button class="secondary" onclick="resetStats()">Reset Stats</button>
+          <button class="secondary" onclick="downloadFrames()">Download Frames</button>
+          <button class="secondary" onclick="clearFrames()">Clear Stored Frames</button>
           <button class="secondary" onclick="togglePause()">
             <span id="pauseBtn">Pause</span>
           </button>
@@ -327,87 +510,44 @@ app.get('/', (req, res) => {
           <h3 style="margin-bottom: 10px;">📊 Real-time Data Stream</h3>
           <div id="dataLog"></div>
         </div>
+
+        <div class="api-section">
+          <h3>📡 API Endpoints</h3>
+          <div class="api-endpoint">
+            <span class="method">GET</span>
+            <span class="path">/api/frames</span>
+            <div class="desc">Get all stored frames (query: ?limit=100&deviceId=ESP32_001)</div>
+          </div>
+          <div class="api-endpoint">
+            <span class="method">GET</span>
+            <span class="path">/api/frames/latest</span>
+            <div class="desc">Get the latest frame (query: ?deviceId=ESP32_001)</div>
+          </div>
+          <div class="api-endpoint">
+            <span class="method">GET</span>
+            <span class="path">/api/frames/range</span>
+            <div class="desc">Get frames by time range (query: ?start=2024-01-01T00:00:00Z&end=2024-01-01T23:59:59Z)</div>
+          </div>
+          <div class="api-endpoint">
+            <span class="method">GET</span>
+            <span class="path">/api/frames/:sequence</span>
+            <div class="desc">Get specific frame by sequence number</div>
+          </div>
+          <div class="api-endpoint">
+            <span class="method">DELETE</span>
+            <span class="path">/api/frames</span>
+            <div class="desc">Delete all stored frames</div>
+          </div>
+        </div>
       </div>
 
       <script>
-        // Auto-detect WSS for HTTPS or WS for HTTP
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        let ws = null;
-        let usePolling = false;
-        let pollingInterval = null;
-
-        function connectWebSocket() {
-          try {
-            ws = new WebSocket(wsProtocol + '//' + window.location.host);
-
-            ws.onopen = function() {
-              console.log('✓ Connected to server via WebSocket');
-              updateStatus(true);
-              usePolling = false;
-            };
-
-            ws.onmessage = function(event) {
-              const message = JSON.parse(event.data);
-              
-              if (message.type === 'frame') {
-                handleFrame(message.data, message.stats);
-              } else if (message.type === 'stats') {
-                updateStats(message.data);
-              } else if (message.type === 'reset') {
-                location.reload();
-              }
-            };
-
-            ws.onerror = function(error) {
-              console.error('WebSocket error:', error);
-              console.log('Falling back to HTTP polling...');
-              usePolling = true;
-              startPolling();
-            };
-
-            ws.onclose = function() {
-              console.log('✗ Disconnected from server');
-              updateStatus(false);
-              
-              // Retry connection after 3 seconds
-              if (!usePolling) {
-                setTimeout(connectWebSocket, 3000);
-              }
-            };
-          } catch (error) {
-            console.error('WebSocket connection failed:', error);
-            console.log('Using HTTP polling instead');
-            usePolling = true;
-            startPolling();
-          }
-        }
-
-        function startPolling() {
-          if (pollingInterval) return;
-          
-          updateStatus(true);
-          console.log('✓ Connected via HTTP polling');
-          
-          pollingInterval = setInterval(() => {
-            fetch('/api/status')
-              .then(response => response.json())
-              .then(data => {
-                updateStats(data.stats);
-              })
-              .catch(error => {
-                console.error('Polling error:', error);
-                updateStatus(false);
-              });
-          }, 500); // Poll every 500ms
-        }
-
-        // Start connection
-        connectWebSocket();
+        let ws = new WebSocket(wsProtocol + '//' + window.location.host);
         let isPaused = false;
         let lastFrameTime = Date.now();
         let frameCount = 0;
         let sampleCount = 0;
-        let lastFrameData = null;
 
         ws.onopen = function() {
           console.log('✓ Connected to server');
@@ -434,14 +574,12 @@ app.get('/', (req, res) => {
         ws.onclose = function() {
           console.log('✗ Disconnected from server');
           updateStatus(false);
+          setTimeout(() => location.reload(), 3000);
         };
 
         function handleFrame(frameData, stats) {
           if (isPaused) return;
-          
-          lastFrameData = frameData;
 
-          // Update frame rate calculation
           frameCount++;
           sampleCount += frameData.samplesInFrame;
           const now = Date.now();
@@ -450,14 +588,11 @@ app.get('/', (req, res) => {
           if (elapsed >= 1) {
             document.getElementById('frameRate').textContent = 
               Math.round(frameCount / elapsed) + ' Hz';
-            document.getElementById('sampleRate').textContent = 
-              Math.round(sampleCount / elapsed) + ' Hz';
             frameCount = 0;
             sampleCount = 0;
             lastFrameTime = now;
           }
 
-          // Update total stats
           if (stats) {
             document.getElementById('framesReceived').textContent = 
               stats.totalFrames.toLocaleString();
@@ -467,7 +602,6 @@ app.get('/', (req, res) => {
               stats.droppedFrames.toLocaleString();
           }
 
-          // Log frame
           const logDiv = document.getElementById('dataLog');
           const entry = document.createElement('div');
           entry.className = 'log-entry';
@@ -476,10 +610,9 @@ app.get('/', (req, res) => {
           const frameInfo = \`Frame #\${frameData.frameSequence}\`;
           const sampleInfo = \`\${frameData.samplesInFrame} samples\`;
           
-          // Show first sample values
           const firstSample = frameData.samples && frameData.samples[0];
-          const ch0 = firstSample ? \`CH0: \${firstSample.ch0.raw}/\${firstSample.ch0.ema}\` : '';
-          const ch1 = firstSample ? \`CH1: \${firstSample.ch1.raw}/\${firstSample.ch1.ema}\` : '';
+          const ch0 = firstSample ? \`CH0: \${firstSample.ch0.raw}\` : '';
+          const ch1 = firstSample ? \`CH1: \${firstSample.ch1.raw}\` : '';
           
           entry.innerHTML = \`
             <span class="log-time">\${time}</span>
@@ -491,7 +624,6 @@ app.get('/', (req, res) => {
           
           logDiv.insertBefore(entry, logDiv.firstChild);
           
-          // Keep only last 100 entries
           while (logDiv.children.length > 100) {
             logDiv.removeChild(logDiv.lastChild);
           }
@@ -522,9 +654,41 @@ app.get('/', (req, res) => {
         }
 
         function resetStats() {
-          fetch('/api/reset', { method: 'POST' })
+          if (confirm('Reset all statistics?')) {
+            fetch('/api/reset', { method: 'POST' })
+              .then(response => response.json())
+              .then(data => {
+                console.log('Stats reset:', data);
+                location.reload();
+              });
+          }
+        }
+
+        function downloadFrames() {
+          fetch('/api/frames')
             .then(response => response.json())
-            .then(data => console.log('Stats reset:', data));
+            .then(data => {
+              const blob = new Blob([JSON.stringify(data.frames, null, 2)], 
+                { type: 'application/json' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = \`emg_frames_\${new Date().toISOString()}.json\`;
+              a.click();
+              URL.revokeObjectURL(url);
+            });
+        }
+
+        function clearFrames() {
+          if (confirm('Clear all stored frames?')) {
+            fetch('/api/frames', { method: 'DELETE' })
+              .then(response => response.json())
+              .then(data => {
+                console.log('Frames cleared:', data);
+                alert(\`Cleared \${data.deletedCount} frames\`);
+                updateStoredFramesCount();
+              });
+          }
         }
 
         function togglePause() {
@@ -533,17 +697,16 @@ app.get('/', (req, res) => {
             isPaused ? 'Resume' : 'Pause';
         }
 
-        // Update client count every 2 seconds
-        setInterval(function() {
-          if (!usePolling) {
-            fetch('/api/status')
-              .then(response => response.json())
-              .then(data => {
-                // Could update additional stats here
-              })
-              .catch(error => console.error('Status check failed:', error));
-          }
-        }, 2000);
+        function updateStoredFramesCount() {
+          fetch('/api/status')
+            .then(response => response.json())
+            .then(data => {
+              document.getElementById('storedFrames').textContent = 
+                data.storedFrames.toLocaleString();
+            });
+        }
+
+        setInterval(updateStoredFramesCount, 2000);
       </script>
     </body>
     </html>
@@ -558,5 +721,12 @@ server.listen(PORT, () => {
   console.log(`📡 HTTP Server: http://localhost:${PORT}`);
   console.log(`📡 POST Endpoint: http://localhost:${PORT}/api/emg`);
   console.log(`🔌 WebSocket: ws://localhost:${PORT}`);
+  console.log('');
+  console.log('📊 NEW Data Endpoints:');
+  console.log(`   GET  /api/frames - Get all stored frames`);
+  console.log(`   GET  /api/frames/latest - Get latest frame`);
+  console.log(`   GET  /api/frames/range - Get frames by time`);
+  console.log(`   GET  /api/frames/:seq - Get frame by sequence`);
+  console.log(`   DELETE /api/frames - Clear all frames`);
   console.log('=================================');
 });
