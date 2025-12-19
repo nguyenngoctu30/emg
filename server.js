@@ -330,11 +330,84 @@ app.get('/', (req, res) => {
       </div>
 
       <script>
-        const ws = new WebSocket('ws://' + window.location.host);
+        // Auto-detect WSS for HTTPS or WS for HTTP
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        let ws = null;
+        let usePolling = false;
+        let pollingInterval = null;
+
+        function connectWebSocket() {
+          try {
+            ws = new WebSocket(wsProtocol + '//' + window.location.host);
+
+            ws.onopen = function() {
+              console.log('✓ Connected to server via WebSocket');
+              updateStatus(true);
+              usePolling = false;
+            };
+
+            ws.onmessage = function(event) {
+              const message = JSON.parse(event.data);
+              
+              if (message.type === 'frame') {
+                handleFrame(message.data, message.stats);
+              } else if (message.type === 'stats') {
+                updateStats(message.data);
+              } else if (message.type === 'reset') {
+                location.reload();
+              }
+            };
+
+            ws.onerror = function(error) {
+              console.error('WebSocket error:', error);
+              console.log('Falling back to HTTP polling...');
+              usePolling = true;
+              startPolling();
+            };
+
+            ws.onclose = function() {
+              console.log('✗ Disconnected from server');
+              updateStatus(false);
+              
+              // Retry connection after 3 seconds
+              if (!usePolling) {
+                setTimeout(connectWebSocket, 3000);
+              }
+            };
+          } catch (error) {
+            console.error('WebSocket connection failed:', error);
+            console.log('Using HTTP polling instead');
+            usePolling = true;
+            startPolling();
+          }
+        }
+
+        function startPolling() {
+          if (pollingInterval) return;
+          
+          updateStatus(true);
+          console.log('✓ Connected via HTTP polling');
+          
+          pollingInterval = setInterval(() => {
+            fetch('/api/status')
+              .then(response => response.json())
+              .then(data => {
+                updateStats(data.stats);
+              })
+              .catch(error => {
+                console.error('Polling error:', error);
+                updateStatus(false);
+              });
+          }, 500); // Poll every 500ms
+        }
+
+        // Start connection
+        connectWebSocket();
         let isPaused = false;
         let lastFrameTime = Date.now();
         let frameCount = 0;
         let sampleCount = 0;
+        let lastFrameData = null;
 
         ws.onopen = function() {
           console.log('✓ Connected to server');
@@ -365,6 +438,8 @@ app.get('/', (req, res) => {
 
         function handleFrame(frameData, stats) {
           if (isPaused) return;
+          
+          lastFrameData = frameData;
 
           // Update frame rate calculation
           frameCount++;
@@ -383,12 +458,14 @@ app.get('/', (req, res) => {
           }
 
           // Update total stats
-          document.getElementById('framesReceived').textContent = 
-            stats.totalFrames.toLocaleString();
-          document.getElementById('samplesReceived').textContent = 
-            stats.totalSamples.toLocaleString();
-          document.getElementById('droppedFrames').textContent = 
-            stats.droppedFrames.toLocaleString();
+          if (stats) {
+            document.getElementById('framesReceived').textContent = 
+              stats.totalFrames.toLocaleString();
+            document.getElementById('samplesReceived').textContent = 
+              stats.totalSamples.toLocaleString();
+            document.getElementById('droppedFrames').textContent = 
+              stats.droppedFrames.toLocaleString();
+          }
 
           // Log frame
           const logDiv = document.getElementById('dataLog');
@@ -458,11 +535,14 @@ app.get('/', (req, res) => {
 
         // Update client count every 2 seconds
         setInterval(function() {
-          fetch('/api/status')
-            .then(response => response.json())
-            .then(data => {
-              // Could update additional stats here
-            });
+          if (!usePolling) {
+            fetch('/api/status')
+              .then(response => response.json())
+              .then(data => {
+                // Could update additional stats here
+              })
+              .catch(error => console.error('Status check failed:', error));
+          }
         }, 2000);
       </script>
     </body>
