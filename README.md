@@ -117,9 +117,14 @@ Dashboard truy cập tại `/` cung cấp:
 
 ### Cài đặt:
 ```bash
-# Clone repository (nếu có)
-git clone <repository-url>
-cd <project-directory>
+# Clone repository từ GitHub
+git clone https://github.com/nguyenngoctu30/emg.git
+
+# Hoặc sử dụng SSH
+git clone git@github.com:nguyenngoctu30/emg.git
+
+# Di chuyển vào thư mục project
+cd emg
 
 # Cài đặt dependencies
 npm install express ws body-parser
