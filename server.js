@@ -15,17 +15,14 @@ app.use(express.static('public'));
 // Store connected clients and stats
 let clients = [];
 let stats = {
-  framesReceived: 0,
-  samplesReceived: 0,
-  lastFrameSequence: -1,
-  droppedFrames: 0,
+  messagesReceived: 0,
   lastReceiveTime: null,
   devices: {}
 };
 
-// ========== NEW: Store recent frames ==========
-const MAX_STORED_FRAMES = 1000; // Lưu tối đa 1000 frames gần nhất
-let recentFrames = []; // Mảng lưu frames theo thứ tự thời gian
+// Store recent data points
+const MAX_STORED_POINTS = 1000;
+let recentData = [];
 
 // WebSocket connection handler
 wss.on('connection', (ws) => {
@@ -34,16 +31,6 @@ wss.on('connection', (ws) => {
 
   // Send current stats to new client
   ws.send(JSON.stringify({ type: 'stats', data: stats }));
-
-  ws.on('message', (message) => {
-    try {
-      const data = JSON.parse(message);
-      console.log('Received data:', data);
-      broadcast({ type: 'data', data });
-    } catch (error) {
-      console.error('Error parsing message:', error);
-    }
-  });
 
   ws.on('close', () => {
     console.log('📴 Client disconnected');
@@ -55,78 +42,70 @@ wss.on('connection', (ws) => {
   });
 });
 
-// HTTP POST endpoint to receive frame data from ESP32
+// HTTP POST endpoint to receive data from ESP32 C6
 app.post('/api/emg', (req, res) => {
   try {
-    const frameData = req.body;
-    const deviceId = frameData.deviceId || 'unknown';
-    const frameSeq = frameData.frameSequence;
-    const samplesCount = frameData.samplesInFrame || 0;
+    const data = req.body;
+    const deviceId = data.deviceId || 'unknown';
+    
+    // Format nhận từ ESP32 C6:
+    // {
+    //   "timestamp": 12345,
+    //   "deviceId": "ESP32_C6_001",
+    //   "channel0": { "rawValue": 100, "averageValue": 95 },
+    //   "channel1": { "rawValue": 200, "averageValue": 195 }
+    // }
     
     // Update stats
-    stats.framesReceived++;
-    stats.samplesReceived += samplesCount;
+    stats.messagesReceived++;
     stats.lastReceiveTime = new Date().toISOString();
     
     // Track per-device stats
     if (!stats.devices[deviceId]) {
       stats.devices[deviceId] = {
-        framesReceived: 0,
-        samplesReceived: 0,
-        lastFrameSequence: -1,
-        droppedFrames: 0
+        messagesReceived: 0,
+        lastTimestamp: 0
       };
     }
     
     const deviceStats = stats.devices[deviceId];
-    deviceStats.framesReceived++;
-    deviceStats.samplesReceived += samplesCount;
+    deviceStats.messagesReceived++;
+    deviceStats.lastTimestamp = data.timestamp;
     
-    // Detect dropped frames
-    if (deviceStats.lastFrameSequence !== -1) {
-      const expectedSeq = deviceStats.lastFrameSequence + 1;
-      if (frameSeq > expectedSeq) {
-        const dropped = frameSeq - expectedSeq;
-        deviceStats.droppedFrames += dropped;
-        stats.droppedFrames += dropped;
-        console.log(`⚠️  Dropped ${dropped} frame(s) from ${deviceId}`);
-      }
-    }
-    deviceStats.lastFrameSequence = frameSeq;
-    
-    // ========== NEW: Store frame data ==========
-    const frameWithTimestamp = {
-      ...frameData,
+    // Store data point
+    const dataPoint = {
+      ...data,
       receivedAt: new Date().toISOString(),
       serverTimestamp: Date.now()
     };
     
-    recentFrames.push(frameWithTimestamp);
+    recentData.push(dataPoint);
     
-    // Keep only recent frames
-    if (recentFrames.length > MAX_STORED_FRAMES) {
-      recentFrames.shift(); // Remove oldest frame
+    // Keep only recent data
+    if (recentData.length > MAX_STORED_POINTS) {
+      recentData.shift();
     }
     
-    // Log received frame
-    console.log(`✓ Frame #${frameSeq} from ${deviceId}: ${samplesCount} samples @ ${frameData.samplingRate}Hz`);
+    // Log received data
+    console.log(`✓ Data from ${deviceId}:`, 
+      `CH0[raw:${data.channel0?.rawValue}, avg:${data.channel0?.averageValue}]`,
+      `CH1[raw:${data.channel1?.rawValue}, avg:${data.channel1?.averageValue}]`);
     
     // Broadcast to all WebSocket clients
     broadcast({
-      type: 'frame',
-      data: frameData,
+      type: 'data',
+      data: dataPoint,
       stats: {
-        totalFrames: stats.framesReceived,
-        totalSamples: stats.samplesReceived,
-        droppedFrames: stats.droppedFrames
+        totalMessages: stats.messagesReceived,
+        device: deviceId
       }
     });
     
     // Quick response to ESP32
     res.json({ 
       success: true,
-      frameSequence: frameSeq,
-      samplesReceived: samplesCount
+      timestamp: data.timestamp,
+      received: true
     });
     
   } catch (error) {
@@ -139,159 +118,122 @@ app.post('/api/emg', (req, res) => {
   }
 });
 
-// ========== NEW: Get all recent frames ==========
-app.get('/api/frames', (req, res) => {
-  const limit = parseInt(req.query.limit) || recentFrames.length;
+// Get all recent data
+app.get('/api/data', (req, res) => {
+  const limit = parseInt(req.query.limit) || recentData.length;
   const deviceId = req.query.deviceId;
   
-  let frames = recentFrames;
+  let data = recentData;
   
-  // Filter by device if specified
   if (deviceId) {
-    frames = frames.filter(f => f.deviceId === deviceId);
+    data = data.filter(d => d.deviceId === deviceId);
   }
   
-  // Limit results
-  const result = frames.slice(-limit);
+  const result = data.slice(-limit);
   
   res.json({
     success: true,
     count: result.length,
-    totalStored: recentFrames.length,
-    frames: result
+    totalStored: recentData.length,
+    data: result
   });
 });
 
-// ========== NEW: Get latest frame ==========
-app.get('/api/frames/latest', (req, res) => {
+// Get latest data point
+app.get('/api/data/latest', (req, res) => {
   const deviceId = req.query.deviceId;
   
-  let frame = null;
+  let dataPoint = null;
   
   if (deviceId) {
-    // Get latest frame from specific device
-    for (let i = recentFrames.length - 1; i >= 0; i--) {
-      if (recentFrames[i].deviceId === deviceId) {
-        frame = recentFrames[i];
+    for (let i = recentData.length - 1; i >= 0; i--) {
+      if (recentData[i].deviceId === deviceId) {
+        dataPoint = recentData[i];
         break;
       }
     }
   } else {
-    // Get latest frame from any device
-    frame = recentFrames[recentFrames.length - 1] || null;
+    dataPoint = recentData[recentData.length - 1] || null;
   }
   
-  if (frame) {
+  if (dataPoint) {
     res.json({
       success: true,
-      frame: frame
+      data: dataPoint
     });
   } else {
     res.status(404).json({
       success: false,
-      message: 'No frames available'
+      message: 'No data available'
     });
   }
 });
 
-// ========== NEW: Get frames by time range ==========
-app.get('/api/frames/range', (req, res) => {
+// Get data by time range
+app.get('/api/data/range', (req, res) => {
   const startTime = req.query.start ? new Date(req.query.start).getTime() : 0;
   const endTime = req.query.end ? new Date(req.query.end).getTime() : Date.now();
   const deviceId = req.query.deviceId;
   
-  let frames = recentFrames.filter(f => {
-    const frameTime = f.serverTimestamp;
-    return frameTime >= startTime && frameTime <= endTime;
+  let data = recentData.filter(d => {
+    const dataTime = d.serverTimestamp;
+    return dataTime >= startTime && dataTime <= endTime;
   });
   
-  // Filter by device if specified
   if (deviceId) {
-    frames = frames.filter(f => f.deviceId === deviceId);
+    data = data.filter(d => d.deviceId === deviceId);
   }
   
   res.json({
     success: true,
-    count: frames.length,
+    count: data.length,
     startTime: new Date(startTime).toISOString(),
     endTime: new Date(endTime).toISOString(),
-    frames: frames
+    data: data
   });
 });
 
-// ========== NEW: Get frame by sequence number ==========
-app.get('/api/frames/:sequence', (req, res) => {
-  const sequence = parseInt(req.params.sequence);
-  const deviceId = req.query.deviceId;
-  
-  let frame = null;
-  
-  if (deviceId) {
-    frame = recentFrames.find(f => 
-      f.frameSequence === sequence && f.deviceId === deviceId
-    );
-  } else {
-    frame = recentFrames.find(f => f.frameSequence === sequence);
-  }
-  
-  if (frame) {
-    res.json({
-      success: true,
-      frame: frame
-    });
-  } else {
-    res.status(404).json({
-      success: false,
-      message: `Frame #${sequence} not found`
-    });
-  }
-});
-
-// ========== NEW: Delete all stored frames ==========
-app.delete('/api/frames', (req, res) => {
-  const previousCount = recentFrames.length;
-  recentFrames = [];
+// Delete all stored data
+app.delete('/api/data', (req, res) => {
+  const previousCount = recentData.length;
+  recentData = [];
   
   res.json({
     success: true,
-    message: 'All frames deleted',
+    message: 'All data deleted',
     deletedCount: previousCount
   });
 });
 
-// HTTP GET endpoint to check server status
+// Server status
 app.get('/api/status', (req, res) => {
   res.json({
     status: 'online',
     connectedClients: clients.length,
     stats: stats,
-    storedFrames: recentFrames.length,
-    maxStoredFrames: MAX_STORED_FRAMES,
+    storedDataPoints: recentData.length,
+    maxStoredPoints: MAX_STORED_POINTS,
     timestamp: new Date().toISOString()
   });
 });
 
-// Reset stats endpoint
+// Reset stats
 app.post('/api/reset', (req, res) => {
   stats = {
-    framesReceived: 0,
-    samplesReceived: 0,
-    lastFrameSequence: -1,
-    droppedFrames: 0,
+    messagesReceived: 0,
     lastReceiveTime: null,
     devices: {}
   };
   
-  // Optionally clear stored frames too
-  if (req.query.clearFrames === 'true') {
-    recentFrames = [];
+  if (req.query.clearData === 'true') {
+    recentData = [];
   }
   
   broadcast({ type: 'reset' });
   res.json({ 
     success: true, 
     message: 'Stats reset',
-    framesCleared: req.query.clearFrames === 'true'
+    dataCleared: req.query.clearData === 'true'
   });
 });
 
@@ -309,26 +251,29 @@ function broadcast(message) {
   });
 }
 
-// Serve enhanced HTML dashboard
+// Serve HTML dashboard
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
     <head>
-      <title>EMG Frame Stream Dashboard</title>
+      <title>EMG Real-time Dashboard</title>
+      <meta charset="UTF-8">
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
           font-family: 'Segoe UI', Arial, sans-serif; 
-          background: #1a1a1a; 
+          background: #0a0a0a; 
           color: #fff;
           padding: 20px;
         }
-        .container { max-width: 1400px; margin: 0 auto; }
+        .container { max-width: 1600px; margin: 0 auto; }
         h1 { 
-          font-size: 24px; 
+          font-size: 28px; 
           margin-bottom: 20px;
-          color: #00ff88;
+          background: linear-gradient(90deg, #00ff88, #00ccff);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
         }
         .stats-grid {
           display: grid;
@@ -337,24 +282,26 @@ app.get('/', (req, res) => {
           margin-bottom: 20px;
         }
         .stat-card {
-          background: #2a2a2a;
-          padding: 15px;
-          border-radius: 8px;
-          border-left: 4px solid #00ff88;
+          background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+          padding: 20px;
+          border-radius: 12px;
+          border: 1px solid #00ff8844;
+          box-shadow: 0 4px 20px rgba(0,255,136,0.1);
         }
         .stat-label {
-          font-size: 12px;
+          font-size: 11px;
           color: #888;
           text-transform: uppercase;
-          margin-bottom: 5px;
+          letter-spacing: 1px;
+          margin-bottom: 8px;
         }
         .stat-value {
-          font-size: 28px;
+          font-size: 32px;
           font-weight: bold;
-          color: #00ff88;
+          background: linear-gradient(90deg, #00ff88, #00ccff);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
         }
-        .stat-value.warning { color: #ff9500; }
-        .stat-value.error { color: #ff3b30; }
         .controls {
           display: flex;
           gap: 10px;
@@ -362,182 +309,165 @@ app.get('/', (req, res) => {
           flex-wrap: wrap;
         }
         button {
-          padding: 10px 20px;
-          background: #00ff88;
-          color: #1a1a1a;
+          padding: 12px 24px;
+          background: linear-gradient(135deg, #00ff88, #00ccff);
+          color: #0a0a0a;
           border: none;
-          border-radius: 6px;
+          border-radius: 8px;
           cursor: pointer;
           font-weight: bold;
-          transition: all 0.2s;
+          font-size: 14px;
+          transition: all 0.3s;
         }
-        button:hover { background: #00cc6a; }
+        button:hover { 
+          transform: translateY(-2px);
+          box-shadow: 0 4px 20px rgba(0,255,136,0.4);
+        }
         button.secondary {
-          background: #444;
-          color: #fff;
+          background: #2a2a3e;
+          color: #00ff88;
+          border: 1px solid #00ff8844;
         }
-        button.secondary:hover { background: #555; }
+        button.secondary:hover { 
+          background: #3a3a4e;
+          box-shadow: 0 4px 20px rgba(0,255,136,0.2);
+        }
         #status {
           display: inline-block;
-          padding: 4px 12px;
-          border-radius: 12px;
+          padding: 6px 16px;
+          border-radius: 20px;
           font-size: 12px;
           font-weight: bold;
+          animation: pulse 2s infinite;
         }
         #status.connected {
           background: #00ff88;
-          color: #1a1a1a;
+          color: #0a0a0a;
         }
         #status.disconnected {
           background: #ff3b30;
           color: #fff;
         }
-        .chart-container {
-          background: #2a2a2a;
-          padding: 20px;
-          border-radius: 8px;
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.7; }
+        }
+        .chart-section {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 20px;
           margin-bottom: 20px;
         }
+        .chart-container {
+          background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+          padding: 20px;
+          border-radius: 12px;
+          border: 1px solid #00ff8844;
+        }
+        .chart-container h3 {
+          color: #00ff88;
+          margin-bottom: 15px;
+          font-size: 18px;
+        }
+        canvas {
+          width: 100% !important;
+          height: 250px !important;
+        }
         #dataLog {
-          background: #2a2a2a;
-          padding: 15px;
+          background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+          padding: 20px;
           height: 400px;
           overflow-y: auto;
-          border-radius: 8px;
+          border-radius: 12px;
+          border: 1px solid #00ff8844;
           font-family: 'Courier New', monospace;
           font-size: 13px;
         }
         .log-entry {
-          padding: 8px;
-          border-bottom: 1px solid #333;
-          display: flex;
-          justify-content: space-between;
+          padding: 10px;
+          border-bottom: 1px solid #00ff8822;
+          display: grid;
+          grid-template-columns: auto 1fr 1fr;
+          gap: 20px;
+          transition: all 0.2s;
         }
-        .log-entry:hover { background: #333; }
+        .log-entry:hover { 
+          background: #00ff8811;
+          border-left: 3px solid #00ff88;
+          padding-left: 17px;
+        }
         .log-time {
           color: #888;
-          margin-right: 15px;
         }
-        .log-frame {
+        .log-channel {
           color: #00ff88;
           font-weight: bold;
         }
-        .log-samples {
-          color: #0af;
-        }
-        .api-section {
-          background: #2a2a2a;
-          padding: 20px;
-          border-radius: 8px;
-          margin-top: 20px;
-        }
-        .api-section h3 {
-          color: #00ff88;
-          margin-bottom: 15px;
-        }
-        .api-endpoint {
-          background: #1a1a1a;
-          padding: 10px;
-          border-radius: 4px;
-          margin-bottom: 10px;
-          font-family: 'Courier New', monospace;
-          font-size: 12px;
-        }
-        .api-endpoint .method {
-          color: #0af;
-          font-weight: bold;
-          margin-right: 10px;
-        }
-        .api-endpoint .path {
-          color: #00ff88;
-        }
-        .api-endpoint .desc {
-          color: #888;
-          margin-top: 5px;
+        .log-value {
+          color: #00ccff;
         }
         ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: #1a1a1a; }
+        ::-webkit-scrollbar-track { background: #1a1a2e; }
         ::-webkit-scrollbar-thumb { 
-          background: #00ff88; 
+          background: linear-gradient(180deg, #00ff88, #00ccff);
           border-radius: 4px;
         }
+        @media (max-width: 768px) {
+          .chart-section {
+            grid-template-columns: 1fr;
+          }
+        }
       </style>
+      <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     </head>
     <body>
       <div class="container">
-        <h1>🔬 EMG Frame Stream Dashboard</h1>
+        <h1>⚡ EMG Real-time Monitor</h1>
         
         <div class="stats-grid">
           <div class="stat-card">
             <div class="stat-label">Connection</div>
             <div class="stat-value">
-              <span id="status" class="disconnected">Disconnected</span>
+              <span id="status" class="disconnected">●</span>
             </div>
           </div>
           <div class="stat-card">
-            <div class="stat-label">Frames Received</div>
-            <div class="stat-value" id="framesReceived">0</div>
+            <div class="stat-label">Messages</div>
+            <div class="stat-value" id="messagesReceived">0</div>
           </div>
           <div class="stat-card">
-            <div class="stat-label">Stored Frames</div>
-            <div class="stat-value" id="storedFrames">0</div>
+            <div class="stat-label">Stored Points</div>
+            <div class="stat-value" id="storedPoints">0</div>
           </div>
           <div class="stat-card">
-            <div class="stat-label">Total Samples</div>
-            <div class="stat-value" id="samplesReceived">0</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-label">Dropped Frames</div>
-            <div class="stat-value error" id="droppedFrames">0</div>
-          </div>
-          <div class="stat-card">
-            <div class="stat-label">Frame Rate</div>
-            <div class="stat-value" id="frameRate">0 Hz</div>
+            <div class="stat-label">Data Rate</div>
+            <div class="stat-value" id="dataRate">0 Hz</div>
           </div>
         </div>
 
         <div class="controls">
-          <button onclick="clearLog()">Clear Log</button>
-          <button class="secondary" onclick="resetStats()">Reset Stats</button>
-          <button class="secondary" onclick="downloadFrames()">Download Frames</button>
-          <button class="secondary" onclick="clearFrames()">Clear Stored Frames</button>
+          <button onclick="clearLog()">🗑️ Clear Log</button>
+          <button class="secondary" onclick="resetStats()">🔄 Reset Stats</button>
+          <button class="secondary" onclick="downloadData()">💾 Download</button>
           <button class="secondary" onclick="togglePause()">
-            <span id="pauseBtn">Pause</span>
+            <span id="pauseBtn">⏸️ Pause</span>
           </button>
         </div>
 
-        <div class="chart-container">
-          <h3 style="margin-bottom: 10px;">📊 Real-time Data Stream</h3>
-          <div id="dataLog"></div>
+        <div class="chart-section">
+          <div class="chart-container">
+            <h3>📊 Channel 0 (Raw & Average)</h3>
+            <canvas id="chart0"></canvas>
+          </div>
+          <div class="chart-container">
+            <h3>📊 Channel 1 (Raw & Average)</h3>
+            <canvas id="chart1"></canvas>
+          </div>
         </div>
 
-        <div class="api-section">
-          <h3>📡 API Endpoints</h3>
-          <div class="api-endpoint">
-            <span class="method">GET</span>
-            <span class="path">/api/frames</span>
-            <div class="desc">Get all stored frames (query: ?limit=100&deviceId=ESP32_001)</div>
-          </div>
-          <div class="api-endpoint">
-            <span class="method">GET</span>
-            <span class="path">/api/frames/latest</span>
-            <div class="desc">Get the latest frame (query: ?deviceId=ESP32_001)</div>
-          </div>
-          <div class="api-endpoint">
-            <span class="method">GET</span>
-            <span class="path">/api/frames/range</span>
-            <div class="desc">Get frames by time range (query: ?start=2024-01-01T00:00:00Z&end=2024-01-01T23:59:59Z)</div>
-          </div>
-          <div class="api-endpoint">
-            <span class="method">GET</span>
-            <span class="path">/api/frames/:sequence</span>
-            <div class="desc">Get specific frame by sequence number</div>
-          </div>
-          <div class="api-endpoint">
-            <span class="method">DELETE</span>
-            <span class="path">/api/frames</span>
-            <div class="desc">Delete all stored frames</div>
-          </div>
+        <div class="chart-container">
+          <h3>📜 Live Data Stream</h3>
+          <div id="dataLog"></div>
         </div>
       </div>
 
@@ -545,9 +475,86 @@ app.get('/', (req, res) => {
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         let ws = new WebSocket(wsProtocol + '//' + window.location.host);
         let isPaused = false;
-        let lastFrameTime = Date.now();
-        let frameCount = 0;
-        let sampleCount = 0;
+        let lastDataTime = Date.now();
+        let dataCount = 0;
+
+        // Chart setup
+        const maxDataPoints = 50;
+        const chartConfig = {
+          type: 'line',
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            scales: {
+              y: { 
+                beginAtZero: true,
+                grid: { color: '#00ff8822' },
+                ticks: { color: '#888' }
+              },
+              x: { 
+                display: false,
+                grid: { color: '#00ff8822' }
+              }
+            },
+            plugins: {
+              legend: { 
+                labels: { color: '#fff' },
+                position: 'top'
+              }
+            }
+          }
+        };
+
+        const chart0 = new Chart(document.getElementById('chart0'), {
+          ...chartConfig,
+          data: {
+            labels: [],
+            datasets: [
+              {
+                label: 'Raw',
+                data: [],
+                borderColor: '#00ff88',
+                backgroundColor: 'rgba(0,255,136,0.1)',
+                borderWidth: 2,
+                tension: 0.4
+              },
+              {
+                label: 'Average',
+                data: [],
+                borderColor: '#00ccff',
+                backgroundColor: 'rgba(0,204,255,0.1)',
+                borderWidth: 2,
+                tension: 0.4
+              }
+            ]
+          }
+        });
+
+        const chart1 = new Chart(document.getElementById('chart1'), {
+          ...chartConfig,
+          data: {
+            labels: [],
+            datasets: [
+              {
+                label: 'Raw',
+                data: [],
+                borderColor: '#ff6b6b',
+                backgroundColor: 'rgba(255,107,107,0.1)',
+                borderWidth: 2,
+                tension: 0.4
+              },
+              {
+                label: 'Average',
+                data: [],
+                borderColor: '#ffd93d',
+                backgroundColor: 'rgba(255,217,61,0.1)',
+                borderWidth: 2,
+                tension: 0.4
+              }
+            ]
+          }
+        });
 
         ws.onopen = function() {
           console.log('✓ Connected to server');
@@ -557,8 +564,8 @@ app.get('/', (req, res) => {
         ws.onmessage = function(event) {
           const message = JSON.parse(event.data);
           
-          if (message.type === 'frame') {
-            handleFrame(message.data, message.stats);
+          if (message.type === 'data') {
+            handleData(message.data, message.stats);
           } else if (message.type === 'stats') {
             updateStats(message.data);
           } else if (message.type === 'reset') {
@@ -577,49 +584,65 @@ app.get('/', (req, res) => {
           setTimeout(() => location.reload(), 3000);
         };
 
-        function handleFrame(frameData, stats) {
+        function handleData(data, stats) {
           if (isPaused) return;
 
-          frameCount++;
-          sampleCount += frameData.samplesInFrame;
+          dataCount++;
           const now = Date.now();
-          const elapsed = (now - lastFrameTime) / 1000;
+          const elapsed = (now - lastDataTime) / 1000;
           
           if (elapsed >= 1) {
-            document.getElementById('frameRate').textContent = 
-              Math.round(frameCount / elapsed) + ' Hz';
-            frameCount = 0;
-            sampleCount = 0;
-            lastFrameTime = now;
+            document.getElementById('dataRate').textContent = 
+              Math.round(dataCount / elapsed) + ' Hz';
+            dataCount = 0;
+            lastDataTime = now;
           }
 
           if (stats) {
-            document.getElementById('framesReceived').textContent = 
-              stats.totalFrames.toLocaleString();
-            document.getElementById('samplesReceived').textContent = 
-              stats.totalSamples.toLocaleString();
-            document.getElementById('droppedFrames').textContent = 
-              stats.droppedFrames.toLocaleString();
+            document.getElementById('messagesReceived').textContent = 
+              stats.totalMessages.toLocaleString();
           }
 
+          // Update charts
+          const timestamp = new Date().toLocaleTimeString();
+          
+          // Channel 0
+          chart0.data.labels.push(timestamp);
+          chart0.data.datasets[0].data.push(data.channel0?.rawValue || 0);
+          chart0.data.datasets[1].data.push(data.channel0?.averageValue || 0);
+          
+          if (chart0.data.labels.length > maxDataPoints) {
+            chart0.data.labels.shift();
+            chart0.data.datasets[0].data.shift();
+            chart0.data.datasets[1].data.shift();
+          }
+          chart0.update();
+
+          // Channel 1
+          chart1.data.labels.push(timestamp);
+          chart1.data.datasets[0].data.push(data.channel1?.rawValue || 0);
+          chart1.data.datasets[1].data.push(data.channel1?.averageValue || 0);
+          
+          if (chart1.data.labels.length > maxDataPoints) {
+            chart1.data.labels.shift();
+            chart1.data.datasets[0].data.shift();
+            chart1.data.datasets[1].data.shift();
+          }
+          chart1.update();
+
+          // Update log
           const logDiv = document.getElementById('dataLog');
           const entry = document.createElement('div');
           entry.className = 'log-entry';
           
           const time = new Date().toLocaleTimeString();
-          const frameInfo = \`Frame #\${frameData.frameSequence}\`;
-          const sampleInfo = \`\${frameData.samplesInFrame} samples\`;
-          
-          const firstSample = frameData.samples && frameData.samples[0];
-          const ch0 = firstSample ? \`CH0: \${firstSample.ch0.raw}\` : '';
-          const ch1 = firstSample ? \`CH1: \${firstSample.ch1.raw}\` : '';
+          const ch0 = \`CH0: R:\${data.channel0?.rawValue || 0} A:\${data.channel0?.averageValue || 0}\`;
+          const ch1 = \`CH1: R:\${data.channel1?.rawValue || 0} A:\${data.channel1?.averageValue || 0}\`;
           
           entry.innerHTML = \`
             <span class="log-time">\${time}</span>
-            <span class="log-frame">\${frameInfo}</span>
-            <span class="log-samples">\${sampleInfo}</span>
-            <span>\${ch0}</span>
-            <span>\${ch1}</span>
+            <span class="log-channel">\${ch0}</span>
+            <span class="log-value">\${ch1}</span>
           \`;
           
           logDiv.insertBefore(entry, logDiv.firstChild);
@@ -630,21 +653,17 @@ app.get('/', (req, res) => {
         }
 
         function updateStats(stats) {
-          document.getElementById('framesReceived').textContent = 
-            stats.framesReceived.toLocaleString();
-          document.getElementById('samplesReceived').textContent = 
-            stats.samplesReceived.toLocaleString();
-          document.getElementById('droppedFrames').textContent = 
-            stats.droppedFrames.toLocaleString();
+          document.getElementById('messagesReceived').textContent = 
+            stats.messagesReceived.toLocaleString();
         }
 
         function updateStatus(connected) {
           const status = document.getElementById('status');
           if (connected) {
-            status.textContent = 'Connected';
+            status.textContent = '● Online';
             status.className = 'connected';
           } else {
-            status.textContent = 'Disconnected';
+            status.textContent = '● Offline';
             status.className = 'disconnected';
           }
         }
@@ -664,49 +683,37 @@ app.get('/', (req, res) => {
           }
         }
 
-        function downloadFrames() {
-          fetch('/api/frames')
+        function downloadData() {
+          fetch('/api/data')
             .then(response => response.json())
-            .then(data => {
-              const blob = new Blob([JSON.stringify(data.frames, null, 2)], 
+            .then(result => {
+              const blob = new Blob([JSON.stringify(result.data, null, 2)], 
                 { type: 'application/json' });
               const url = URL.createObjectURL(blob);
               const a = document.createElement('a');
               a.href = url;
-              a.download = \`emg_frames_\${new Date().toISOString()}.json\`;
+              a.download = \`emg_data_\${new Date().toISOString()}.json\`;
               a.click();
               URL.revokeObjectURL(url);
             });
         }
 
-        function clearFrames() {
-          if (confirm('Clear all stored frames?')) {
-            fetch('/api/frames', { method: 'DELETE' })
-              .then(response => response.json())
-              .then(data => {
-                console.log('Frames cleared:', data);
-                alert(\`Cleared \${data.deletedCount} frames\`);
-                updateStoredFramesCount();
-              });
-          }
-        }
-
         function togglePause() {
           isPaused = !isPaused;
-          document.getElementById('pauseBtn').textContent = 
-            isPaused ? 'Resume' : 'Pause';
+          const btn = document.getElementById('pauseBtn');
+          btn.textContent = isPaused ? '▶️ Resume' : '⏸️ Pause';
         }
 
-        function updateStoredFramesCount() {
+        function updateStoredPointsCount() {
           fetch('/api/status')
             .then(response => response.json())
             .then(data => {
-              document.getElementById('storedFrames').textContent = 
-                data.storedFrames.toLocaleString();
+              document.getElementById('storedPoints').textContent = 
+                data.storedDataPoints.toLocaleString();
             });
         }
 
-        setInterval(updateStoredFramesCount, 2000);
+        setInterval(updateStoredPointsCount, 2000);
       </script>
     </body>
     </html>
@@ -716,17 +723,16 @@ app.get('/', (req, res) => {
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
   console.log('=================================');
-  console.log('🚀 EMG Frame Stream Server');
+  console.log('🚀 EMG Real-time Server');
   console.log('=================================');
   console.log(`📡 HTTP Server: http://localhost:${PORT}`);
   console.log(`📡 POST Endpoint: http://localhost:${PORT}/api/emg`);
   console.log(`🔌 WebSocket: ws://localhost:${PORT}`);
   console.log('');
-  console.log('📊 NEW Data Endpoints:');
-  console.log(`   GET  /api/frames - Get all stored frames`);
-  console.log(`   GET  /api/frames/latest - Get latest frame`);
-  console.log(`   GET  /api/frames/range - Get frames by time`);
-  console.log(`   GET  /api/frames/:seq - Get frame by sequence`);
-  console.log(`   DELETE /api/frames - Clear all frames`);
+  console.log('📊 Data Endpoints:');
+  console.log(`   GET  /api/data - Get all stored data`);
+  console.log(`   GET  /api/data/latest - Get latest data`);
+  console.log(`   GET  /api/data/range - Get data by time`);
+  console.log(`   DELETE /api/data - Clear all data`);
   console.log('=================================');
 });
